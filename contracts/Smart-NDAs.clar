@@ -325,3 +325,207 @@
         false
     )
 )
+
+(define-constant ERR-TRANSFER-NOT-FOUND (err u109))
+(define-constant ERR-TRANSFER-ALREADY-PROCESSED (err u110))
+(define-constant ERR-INVALID-TRANSFER-STATUS (err u111))
+(define-constant ERR-CANNOT-TRANSFER-TO-SELF (err u112))
+
+(define-data-var transfer-counter uint u0)
+
+(define-map nda-transfers
+    uint
+    {
+        nda-id: uint,
+        from-owner: principal,
+        to-owner: principal,
+        transfer-reason: (string-ascii 200),
+        status: (string-ascii 20),
+        proposed-at: uint,
+        accepted-at: (optional uint),
+        rejected-at: (optional uint)
+    }
+)
+
+(define-map nda-ownership
+    uint
+    {
+        current-owner: principal,
+        original-creator: principal,
+        last-transfer-id: (optional uint),
+        transfer-count: uint
+    }
+)
+
+(define-map pending-transfers
+    { nda-id: uint, to-owner: principal }
+    uint
+)
+
+(define-public (propose-nda-transfer 
+    (nda-id uint) 
+    (new-owner principal) 
+    (reason (string-ascii 200)))
+    (let
+        (
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (current-owner (get-nda-owner nda-id))
+            (new-transfer-id (+ (var-get transfer-counter) u1))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq current-owner new-owner)) ERR-CANNOT-TRANSFER-TO-SELF)
+        (asserts! (is-none (map-get? pending-transfers { nda-id: nda-id, to-owner: new-owner })) ERR-INVALID-TRANSFER-STATUS)
+        
+        (map-set nda-transfers new-transfer-id {
+            nda-id: nda-id,
+            from-owner: current-owner,
+            to-owner: new-owner,
+            transfer-reason: reason,
+            status: "pending",
+            proposed-at: current-time,
+            accepted-at: none,
+            rejected-at: none
+        })
+        
+        (map-set pending-transfers { nda-id: nda-id, to-owner: new-owner } new-transfer-id)
+        (var-set transfer-counter new-transfer-id)
+        (ok new-transfer-id)
+    )
+)
+
+(define-public (accept-nda-transfer (transfer-id uint))
+    (let
+        (
+            (transfer (unwrap! (map-get? nda-transfers transfer-id) ERR-TRANSFER-NOT-FOUND))
+            (nda-id (get nda-id transfer))
+            (from-owner (get from-owner transfer))
+            (to-owner (get to-owner transfer))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (current-ownership (default-to 
+                { current-owner: from-owner, original-creator: from-owner, last-transfer-id: none, transfer-count: u0 }
+                (map-get? nda-ownership nda-id)))
+        )
+        (asserts! (is-eq tx-sender to-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status transfer) "pending") ERR-TRANSFER-ALREADY-PROCESSED)
+        
+        (map-set nda-transfers transfer-id (merge transfer {
+            status: "accepted",
+            accepted-at: (some current-time)
+        }))
+        
+        (map-set nda-ownership nda-id (merge current-ownership {
+            current-owner: to-owner,
+            last-transfer-id: (some transfer-id),
+            transfer-count: (+ (get transfer-count current-ownership) u1)
+        }))
+        
+        (map-delete pending-transfers { nda-id: nda-id, to-owner: to-owner })
+        (ok true)
+    )
+)
+
+(define-public (reject-nda-transfer (transfer-id uint))
+    (let
+        (
+            (transfer (unwrap! (map-get? nda-transfers transfer-id) ERR-TRANSFER-NOT-FOUND))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (is-eq tx-sender (get to-owner transfer)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status transfer) "pending") ERR-TRANSFER-ALREADY-PROCESSED)
+        
+        (map-set nda-transfers transfer-id (merge transfer {
+            status: "rejected",
+            rejected-at: (some current-time)
+        }))
+        
+        (map-delete pending-transfers { nda-id: (get nda-id transfer), to-owner: (get to-owner transfer) })
+        (ok true)
+    )
+)
+
+(define-private (get-nda-owner (nda-id uint))
+    (match (map-get? nda-ownership nda-id)
+        ownership (get current-owner ownership)
+        (match (map-get? ndas nda-id)
+            nda (get creator nda)
+            (get creator (unwrap-panic (map-get? ndas nda-id)))
+        )
+    )
+)
+
+(define-public (revoke-nda-v2 (nda-id uint))
+    (let
+        (
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (current-owner (get-nda-owner nda-id))
+        )
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status nda) "active") ERR-INVALID-STATUS)
+        
+        (map-set ndas nda-id (merge nda { status: "revoked" }))
+        (ok true)
+    )
+)
+
+(define-public (resolve-breach-v2 
+    (breach-id uint) 
+    (resolution (string-ascii 300)))
+    (let
+        (
+            (breach (unwrap! (map-get? breach-reports breach-id) ERR-BREACH-NOT-FOUND))
+            (nda-id (get nda-id breach))
+            (current-owner (get-nda-owner nda-id))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status breach) "pending") ERR-INVALID-BREACH-STATUS)
+        
+        (map-set breach-reports breach-id (merge breach {
+            status: "resolved",
+            resolved-at: (some current-time),
+            resolution: (some resolution)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (dismiss-breach-v2 (breach-id uint))
+    (let
+        (
+            (breach (unwrap! (map-get? breach-reports breach-id) ERR-BREACH-NOT-FOUND))
+            (nda-id (get nda-id breach))
+            (current-owner (get-nda-owner nda-id))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+        )
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status breach) "pending") ERR-INVALID-BREACH-STATUS)
+        
+        (map-set breach-reports breach-id (merge breach {
+            status: "dismissed",
+            resolved-at: (some current-time),
+            resolution: (some "Breach report dismissed by current NDA owner")
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-nda-transfer (transfer-id uint))
+    (ok (map-get? nda-transfers transfer-id))
+)
+
+(define-read-only (get-nda-ownership-info (nda-id uint))
+    (ok (map-get? nda-ownership nda-id))
+)
+
+(define-read-only (get-pending-transfer (nda-id uint) (to-owner principal))
+    (ok (map-get? pending-transfers { nda-id: nda-id, to-owner: to-owner }))
+)
+
+(define-read-only (get-current-owner (nda-id uint))
+    (ok (get-nda-owner nda-id))
+)
+
+(define-read-only (get-transfer-counter)
+    (ok (var-get transfer-counter))
+)
