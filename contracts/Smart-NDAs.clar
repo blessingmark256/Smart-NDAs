@@ -326,6 +326,315 @@
     )
 )
 
+;; === NDA AUTO-RENEWAL AND EXPIRATION MANAGEMENT SYSTEM ===
+
+;; Error constants for renewal system
+(define-constant ERR-RENEWAL-NOT-FOUND (err u113))
+(define-constant ERR-RENEWAL-ALREADY-VOTED (err u114))
+(define-constant ERR-RENEWAL-EXPIRED (err u115))
+(define-constant ERR-INVALID-NOTIFICATION-PERIOD (err u116))
+(define-constant ERR-NDA-ALREADY-EXPIRED (err u117))
+(define-constant ERR-INSUFFICIENT-VOTES (err u118))
+
+;; Data variables for renewal system
+(define-data-var renewal-counter uint u0)
+
+;; Maps for renewal functionality
+(define-map nda-renewal-settings
+    uint ;; nda-id
+    {
+        auto-renewal-enabled: bool,
+        notification-period: uint, ;; days before expiration to notify
+        grace-period: uint, ;; days after expiration to allow renewal
+        minimum-votes-required: uint, ;; minimum votes needed for renewal
+        new-duration: uint ;; default renewal duration in seconds
+    }
+)
+
+(define-map renewal-proposals
+    uint ;; renewal-id
+    {
+        nda-id: uint,
+        proposer: principal,
+        new-expiration: uint,
+        new-terms-hash: (optional (buff 32)), ;; hash of updated terms if any
+        status: (string-ascii 20), ;; "active", "approved", "rejected", "expired"
+        created-at: uint,
+        voting-deadline: uint,
+        votes-for: uint,
+        votes-against: uint,
+        executed-at: (optional uint)
+    }
+)
+
+(define-map renewal-votes
+    { renewal-id: uint, voter: principal }
+    {
+        vote: bool, ;; true for yes, false for no
+        voted-at: uint,
+        vote-weight: uint ;; currently always 1, future extensibility
+    }
+)
+
+(define-map nda-renewal-history
+    uint ;; nda-id
+    (list 20 uint) ;; list of renewal-ids
+)
+
+(define-map expiration-notifications
+    uint ;; nda-id
+    {
+        last-notification-sent: uint,
+        notification-count: uint,
+        signers-notified: (list 50 principal)
+    }
+)
+
+;; Configure renewal settings for an NDA
+(define-public (configure-nda-renewal 
+    (nda-id uint)
+    (auto-renewal-enabled bool)
+    (notification-period uint)
+    (grace-period uint)
+    (minimum-votes-required uint)
+    (new-duration uint))
+    (let
+        (
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (current-owner (get-nda-owner nda-id))
+        )
+        ;; Only current owner can configure renewal settings
+        (asserts! (is-eq tx-sender current-owner) ERR-NOT-AUTHORIZED)
+        ;; Notification period should be reasonable (1-90 days)
+        (asserts! (and (>= notification-period u1) (<= notification-period u90)) ERR-INVALID-NOTIFICATION-PERIOD)
+        ;; Grace period should be reasonable (1-30 days)
+        (asserts! (and (>= grace-period u1) (<= grace-period u30)) ERR-INVALID-NOTIFICATION-PERIOD)
+        
+        (map-set nda-renewal-settings nda-id {
+            auto-renewal-enabled: auto-renewal-enabled,
+            notification-period: notification-period,
+            grace-period: grace-period,
+            minimum-votes-required: minimum-votes-required,
+            new-duration: new-duration
+        })
+        (ok true)
+    )
+)
+
+;; Propose renewal for an NDA
+(define-public (propose-nda-renewal 
+    (nda-id uint) 
+    (new-expiration uint)
+    (new-terms-hash (optional (buff 32))))
+    (let
+        (
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (renewal-settings (map-get? nda-renewal-settings nda-id))
+            (new-renewal-id (+ (var-get renewal-counter) u1))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (voting-deadline (+ current-time u864000)) ;; 10 days voting period
+            (existing-renewals (default-to (list) (map-get? nda-renewal-history nda-id)))
+        )
+        ;; Check if proposer has signed the NDA
+        (asserts! (has-signed nda-id tx-sender) ERR-NOT-AUTHORIZED)
+        ;; Check if NDA hasn't expired beyond grace period
+        (match renewal-settings
+            settings (asserts! 
+                (< current-time (+ (get expires-at nda) (* (get grace-period settings) u86400)))
+                ERR-NDA-ALREADY-EXPIRED)
+            ;; If no renewal settings, use default 7-day grace period
+            (asserts! (< current-time (+ (get expires-at nda) u604800)) ERR-NDA-ALREADY-EXPIRED)
+        )
+        ;; New expiration should be in the future
+        (asserts! (> new-expiration current-time) ERR-INVALID-STATUS)
+        
+        (map-set renewal-proposals new-renewal-id {
+            nda-id: nda-id,
+            proposer: tx-sender,
+            new-expiration: new-expiration,
+            new-terms-hash: new-terms-hash,
+            status: "active",
+            created-at: current-time,
+            voting-deadline: voting-deadline,
+            votes-for: u0,
+            votes-against: u0,
+            executed-at: none
+        })
+        
+        ;; Update renewal history
+        (map-set nda-renewal-history nda-id 
+            (unwrap-panic (as-max-len? (append existing-renewals new-renewal-id) u20)))
+        
+        (var-set renewal-counter new-renewal-id)
+        (ok new-renewal-id)
+    )
+)
+
+;; Vote on a renewal proposal
+(define-public (vote-on-renewal (renewal-id uint) (vote bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? renewal-proposals renewal-id) ERR-RENEWAL-NOT-FOUND))
+            (nda-id (get nda-id proposal))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (vote-key { renewal-id: renewal-id, voter: tx-sender })
+        )
+        ;; Check if voter has signed the NDA
+        (asserts! (has-signed nda-id tx-sender) ERR-NOT-AUTHORIZED)
+        ;; Check if proposal is still active
+        (asserts! (is-eq (get status proposal) "active") ERR-INVALID-STATUS)
+        ;; Check if voting period hasn't expired
+        (asserts! (< current-time (get voting-deadline proposal)) ERR-RENEWAL-EXPIRED)
+        ;; Check if voter hasn't already voted
+        (asserts! (is-none (map-get? renewal-votes vote-key)) ERR-RENEWAL-ALREADY-VOTED)
+        
+        ;; Record the vote
+        (map-set renewal-votes vote-key {
+            vote: vote,
+            voted-at: current-time,
+            vote-weight: u1
+        })
+        
+        ;; Update vote counts
+        (if vote
+            (map-set renewal-proposals renewal-id 
+                (merge proposal { votes-for: (+ (get votes-for proposal) u1) }))
+            (map-set renewal-proposals renewal-id 
+                (merge proposal { votes-against: (+ (get votes-against proposal) u1) }))
+        )
+        
+        (ok true)
+    )
+)
+
+;; Execute renewal if conditions are met
+(define-public (execute-renewal (renewal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? renewal-proposals renewal-id) ERR-RENEWAL-NOT-FOUND))
+            (nda-id (get nda-id proposal))
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (renewal-settings (map-get? nda-renewal-settings nda-id))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (votes-for (get votes-for proposal))
+            (votes-against (get votes-against proposal))
+            (total-votes (+ votes-for votes-against))
+        )
+        ;; Check if proposal is still active
+        (asserts! (is-eq (get status proposal) "active") ERR-INVALID-STATUS)
+        ;; Check if voting deadline has passed
+        (asserts! (>= current-time (get voting-deadline proposal)) ERR-INVALID-STATUS)
+        
+        ;; Determine if renewal should be approved
+        (let
+            (
+                (min-votes-required (match renewal-settings
+                    settings (get minimum-votes-required settings)
+                    u2)) ;; default minimum
+                (approval-threshold (if (> total-votes u0) (/ (* votes-for u100) total-votes) u0))
+            )
+            ;; Require minimum votes and majority approval (>50%)
+            (if (and (>= total-votes min-votes-required) (> approval-threshold u50))
+                ;; Approve and execute renewal
+                (begin
+                    (map-set renewal-proposals renewal-id 
+                        (merge proposal { 
+                            status: "approved",
+                            executed-at: (some current-time)
+                        }))
+                    ;; Update NDA expiration
+                    (map-set ndas nda-id 
+                        (merge nda { 
+                            expires-at: (get new-expiration proposal),
+                            status: "active"
+                        }))
+                    (ok "approved"))
+                ;; Reject renewal
+                (begin
+                    (map-set renewal-proposals renewal-id 
+                        (merge proposal { status: "rejected" }))
+                    (ok "rejected"))
+            )
+        )
+    )
+)
+
+;; Check if NDA needs renewal notification
+(define-public (check-renewal-notification (nda-id uint))
+    (let
+        (
+            (nda (unwrap! (map-get? ndas nda-id) ERR-NDA-NOT-FOUND))
+            (renewal-settings (map-get? nda-renewal-settings nda-id))
+            (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+            (notification-info (map-get? expiration-notifications nda-id))
+        )
+        (match renewal-settings
+            settings (let
+                (
+                    (notification-threshold (- (get expires-at nda) 
+                        (* (get notification-period settings) u86400)))
+                    (should-notify (and 
+                        (>= current-time notification-threshold)
+                        (< current-time (get expires-at nda))))
+                )
+                (if should-notify
+                    (begin
+                        ;; Update notification record
+                        (map-set expiration-notifications nda-id {
+                            last-notification-sent: current-time,
+                            notification-count: (match notification-info
+                                info (+ (get notification-count info) u1)
+                                u1),
+                            signers-notified: (list) ;; Would contain list of notified signers
+                        })
+                        (ok "notification-sent"))
+                    (ok "no-notification-needed")))
+            (ok "no-renewal-settings")
+        )
+    )
+)
+
+;; Read-only functions for renewal system
+(define-read-only (get-renewal-settings (nda-id uint))
+    (ok (map-get? nda-renewal-settings nda-id))
+)
+
+(define-read-only (get-renewal-proposal (renewal-id uint))
+    (ok (map-get? renewal-proposals renewal-id))
+)
+
+(define-read-only (get-renewal-vote (renewal-id uint) (voter principal))
+    (ok (map-get? renewal-votes { renewal-id: renewal-id, voter: voter }))
+)
+
+(define-read-only (get-nda-renewal-history (nda-id uint))
+    (ok (map-get? nda-renewal-history nda-id))
+)
+
+(define-read-only (get-expiration-notification-info (nda-id uint))
+    (ok (map-get? expiration-notifications nda-id))
+)
+
+(define-read-only (get-renewal-counter)
+    (ok (var-get renewal-counter))
+)
+
+;; Check if NDA is within renewal period
+(define-read-only (is-nda-renewable (nda-id uint))
+    (match (map-get? ndas nda-id)
+        nda (let
+            (
+                (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+                (renewal-settings (map-get? nda-renewal-settings nda-id))
+            )
+            (match renewal-settings
+                settings (< current-time (+ (get expires-at nda) (* (get grace-period settings) u86400)))
+                (< current-time (+ (get expires-at nda) u604800)) ;; default 7-day grace
+            ))
+        false
+    )
+)
+
 (define-constant ERR-TRANSFER-NOT-FOUND (err u109))
 (define-constant ERR-TRANSFER-ALREADY-PROCESSED (err u110))
 (define-constant ERR-INVALID-TRANSFER-STATUS (err u111))
@@ -529,3 +838,4 @@
 (define-read-only (get-transfer-counter)
     (ok (var-get transfer-counter))
 )
+
